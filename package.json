@@ -1,0 +1,29 @@
+{
+  "name": "event-planning-api",
+  "version": "1.0.0",
+  "description": "Nairly event planning marketplace — REST API",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "lint": "eslint src --ext .ts",
+    "hash-superadmin-password": "node scripts/hash-superadmin-password.mjs"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.7",
+    "@hono/zod-validator": "^0.8.0",
+    "@supabase/supabase-js": "^2.49.4",
+    "bcryptjs": "^3.0.3",
+    "dotenv": "^17.4.2",
+    "hono": "^4.7.7",
+    "jose": "^6.2.3",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/node": "^22.15.18",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.3"
+  }
+}
