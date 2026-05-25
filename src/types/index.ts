@@ -5,10 +5,8 @@ export interface AuthUser {
   userType?: string
 }
 
-/** Monitoring panel JWT (`/superadmin/*`), separate from Supabase Auth. */
 export interface SuperadminContext {
   username: string
-  /** Set when the token was issued for a row in `monitoring_admins`. */
   monitoringAdminId?: string
 }
 

@@ -13,7 +13,7 @@ export const SERVICE_KINDS = [
 
 export type ServiceKind = (typeof SERVICE_KINDS)[number]
 
-export const SERVICE_STATUSES = ["draft", "published", "archived"] as const
+export const SERVICE_STATUSES = ["enabled", "disabled"] as const
 export type ServiceStatus = (typeof SERVICE_STATUSES)[number]
 
 export async function assertServiceOwnerOrAdmin(

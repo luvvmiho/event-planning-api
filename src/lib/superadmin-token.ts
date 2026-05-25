@@ -30,7 +30,6 @@ export async function signSuperadminAccessToken(args: {
 		.sign(key);
 }
 
-/** @throws Error if signature/claims invalid (`exp` omitted — rotate secret or revoke session server-side when needed). */
 export async function verifySuperadminAccessToken(
 	token: string,
 ): Promise<{ username: string; monitoringAdminId?: string }> {

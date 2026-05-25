@@ -1,5 +1,6 @@
 import { serve } from '@hono/node-server';
 import 'dotenv/config';
+import type { Context } from 'hono';
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { HTTPException } from 'hono/http-exception';
@@ -8,14 +9,14 @@ import { logger } from 'hono/logger';
 import { adminOrdersRouter } from './routes/admin/orders.js';
 import { adminProvidersRouter } from './routes/admin/providers.js';
 import { categoriesRouter } from './routes/categories.js';
+import { eventPlansRouter } from './routes/event-plans.js';
 import { monitoringRouter } from './routes/monitoring.js';
 import { ordersRouter } from './routes/orders.js';
 import { providerRouter } from './routes/provider.js';
+import { servicesRouter } from './routes/services.js';
 import { timeSlotsRouter } from './routes/time-slots.js';
 import { uploadsRouter } from './routes/uploads.js';
-import { servicesRouter } from './routes/services.js';
 import { venuesRouter } from './routes/venues.js';
-import { eventPlansRouter } from './routes/event-plans.js';
 import { wishlistRouter } from './routes/wishlist.js';
 
 const app = new Hono();
@@ -24,13 +25,49 @@ app.use(logger());
 
 const allowedOrigins = (process.env.ALLOWED_ORIGINS ?? 'http://localhost:3000')
 	.split(',')
-	.map((o) => o.trim());
+	.map((o) => o.trim().replace(/\/$/, ''))
+	.filter(Boolean);
+
+const allowVercelPreviews = allowedOrigins.some((o) => o.endsWith('.vercel.app'));
+
+const isOriginAllowed = (origin: string): boolean => {
+	const normalized = origin.replace(/\/$/, '');
+	if (allowedOrigins.includes(normalized)) return true;
+	if (allowVercelPreviews && /\.vercel\.app$/.test(normalized)) return true;
+	return false;
+};
+
+const resolveAllowOrigin = (origin: string | undefined): string | null => {
+	if (!origin) return allowedOrigins[0] ?? null;
+	const normalized = origin.replace(/\/$/, '');
+	return isOriginAllowed(normalized) ? normalized : null;
+};
+
+const applyCorsToResponse = (c: Context, res: Response): Response => {
+	const allowOrigin = resolveAllowOrigin(c.req.header('origin'));
+	if (allowOrigin) {
+		res.headers.set('Access-Control-Allow-Origin', allowOrigin);
+		res.headers.set('Access-Control-Allow-Credentials', 'true');
+		res.headers.append('Vary', 'Origin');
+	}
+	return res;
+};
 
 app.use(
 	cors({
-		origin: (origin) => (allowedOrigins.includes(origin) ? origin : allowedOrigins[0]),
+		origin: (origin) => {
+			const resolved = resolveAllowOrigin(origin || undefined);
+			if (origin && !resolved) {
+				console.warn(
+					'[cors] rejected origin:',
+					origin,
+					'| allowed:',
+					allowedOrigins.join(', '),
+				);
+			}
+			return resolved;
+		},
 		allowMethods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
-		allowHeaders: ['Content-Type', 'Authorization'],
 		credentials: true,
 	}),
 );
@@ -52,17 +89,17 @@ app.route('/monitoring', monitoringRouter);
 
 app.onError((err, c) => {
 	if (err instanceof HTTPException) {
-		return c.json({ error: err.message }, err.status);
+		return applyCorsToResponse(c, c.json({ error: err.message }, err.status));
 	}
 
 	console.error('[unhandled error]', err);
-	return c.json({ error: 'Internal server error' }, 500);
+	return applyCorsToResponse(c, c.json({ error: 'Internal server error' }, 500));
 });
 
-app.notFound((c) => c.json({ error: 'Route not found' }, 404));
+app.notFound((c) => applyCorsToResponse(c, c.json({ error: 'Route not found' }, 404)));
 
 const port = parseInt(process.env.PORT ?? '4000', 10);
 
-serve({ fetch: app.fetch, port }, () => {
+serve({ fetch: app.fetch, port, hostname: '0.0.0.0' }, (info) => {
 	console.log(`🚀 Nairly API running on http://localhost:${port}`);
 });

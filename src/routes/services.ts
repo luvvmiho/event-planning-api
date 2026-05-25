@@ -10,6 +10,11 @@ import {
   serviceAccessErrorResponse,
 } from "../lib/service-access.js"
 import {
+  attachOptionGroupsToService,
+  serviceOptionGroupInputSchema,
+  syncServiceOptionGroups,
+} from "../lib/service-options.js"
+import {
   assertScopedProviderVenueAccess,
   authenticate,
   requireProvider,
@@ -26,6 +31,9 @@ const serviceBodySchema = z.object({
   description: z.preprocess(emptyToUndef, z.string().trim().max(10000).optional()),
   price_flat: z.coerce.number().int().min(0),
   location: z.preprocess(emptyToUndef, z.string().trim().max(500).optional()),
+  contact_phone: z.preprocess(emptyToUndef, z.string().trim().max(50).optional()),
+  contact_email: z.preprocess(emptyToUndef, z.string().trim().email().optional()),
+  website: z.preprocess(emptyToUndef, z.string().trim().url().optional()),
   image_url: z.preprocess(emptyToUndef, z.string().trim().max(2000).optional()),
   images: z.array(z.string().trim().max(2000)).max(20).optional(),
   sort_order: z.coerce.number().int().optional().default(0),
@@ -41,9 +49,13 @@ const serviceBodySchema = z.object({
   ),
 })
 
-const createServiceBodySchema = serviceBodySchema
+const createServiceBodySchema = serviceBodySchema.extend({
+  option_groups: z.array(serviceOptionGroupInputSchema).max(20).optional(),
+})
 
-const patchServiceBodySchema = serviceBodySchema.partial().refine(
+const patchServiceBodySchema = serviceBodySchema.partial().extend({
+  option_groups: z.array(serviceOptionGroupInputSchema).max(20).optional(),
+}).refine(
   (b) =>
     b.name !== undefined ||
     b.kind !== undefined ||
@@ -51,10 +63,14 @@ const patchServiceBodySchema = serviceBodySchema.partial().refine(
     b.description !== undefined ||
     b.price_flat !== undefined ||
     b.location !== undefined ||
+    b.contact_phone !== undefined ||
+    b.contact_email !== undefined ||
+    b.website !== undefined ||
     b.image_url !== undefined ||
     b.images !== undefined ||
     b.sort_order !== undefined ||
-    b.slug !== undefined,
+    b.slug !== undefined ||
+    b.option_groups !== undefined,
   { message: "Шинэчлэх талбар оруулна уу" },
 )
 
@@ -75,7 +91,7 @@ const patchServiceStatusBodySchema = z.object({
 })
 
 const SERVICE_SELECT_PUBLIC =
-  "id, provider_id, slug, name, kind, short_description, price_flat, location, image_url, images, sort_order, created_at"
+  "id, provider_id, slug, name, kind, short_description, price_flat, location, contact_phone, contact_email, website, image_url, images, sort_order, created_at"
 
 const SERVICE_SELECT_DETAIL = SERVICE_SELECT_PUBLIC + ", description, status, updated_at"
 
@@ -107,7 +123,6 @@ const generateUniqueServiceSlug = async (baseName: string): Promise<string> => {
   return `${base}-${randomUUID().replace(/-/g, "").slice(0, 12)}`
 }
 
-/** Public catalog — published only. */
 servicesRouter.get("/", zValidator("query", listQuerySchema), async (c) => {
   const { kind, provider_id, search, page, limit } = c.req.valid("query")
   const offset = (page - 1) * limit
@@ -119,7 +134,7 @@ servicesRouter.get("/", zValidator("query", listQuerySchema), async (c) => {
   let query = supabase
     .from("provider_services")
     .select(SERVICE_SELECT_PUBLIC, { count: "exact" })
-    .eq("status", "published")
+    .eq("status", "enabled")
     .order("sort_order", { ascending: true })
     .order("created_at", { ascending: false })
     .range(offset, offset + limit - 1)
@@ -135,8 +150,12 @@ servicesRouter.get("/", zValidator("query", listQuerySchema), async (c) => {
   const { data, error, count } = await query
   if (error) return c.json({ error: error.message }, 500)
 
+  const withOptions = await Promise.all(
+    (data ?? []).map((s) => attachOptionGroupsToService(s as unknown as Record<string, unknown>, true)),
+  )
+
   return c.json({
-    data: data ?? [],
+    data: withOptions,
     meta: {
       total: count ?? 0,
       page,
@@ -146,7 +165,6 @@ servicesRouter.get("/", zValidator("query", listQuerySchema), async (c) => {
   })
 })
 
-/** Provider — all own services (any status). */
 servicesRouter.get("/manage", authenticate, requireProvider, async (c) => {
   const user = c.var.user
 
@@ -158,7 +176,10 @@ servicesRouter.get("/manage", authenticate, requireProvider, async (c) => {
     .order("created_at", { ascending: false })
 
   if (error) return c.json({ error: error.message }, 500)
-  return c.json({ data: data ?? [] })
+  const withOptions = await Promise.all(
+    (data ?? []).map((s) => attachOptionGroupsToService(s as unknown as Record<string, unknown>)),
+  )
+  return c.json({ data: withOptions })
 })
 
 servicesRouter.post("/", authenticate, requireProvider, zValidator("json", createServiceBodySchema), async (c) => {
@@ -179,21 +200,35 @@ servicesRouter.post("/", authenticate, requireProvider, zValidator("json", creat
     description: body.description ?? null,
     price_flat: body.price_flat,
     location: body.location ?? null,
+    contact_phone: body.contact_phone ?? null,
+    contact_email: body.contact_email ?? null,
+    website: body.website ?? null,
     image_url: body.image_url ?? null,
     images: body.images ?? [],
     sort_order: body.sort_order,
-    status: "draft" as const,
+    status: "enabled" as const,
     updated_at: new Date().toISOString(),
   }
 
   const { data, error } = await supabase.from("provider_services").insert(row).select(SERVICE_SELECT_DETAIL).single()
 
-  if (error) {
-    if (error.code === "23505") return c.json({ error: "Slug already exists" }, 409)
-    return c.json({ error: error.message }, 400)
+  if (error || !data || typeof data !== "object" || !("id" in data)) {
+    if (error?.code === "23505") return c.json({ error: "Slug already exists" }, 409)
+    return c.json({ error: error?.message ?? "Insert failed" }, 400)
   }
 
-  return c.json({ data }, 201)
+  const serviceId = String((data as { id: string }).id)
+
+  if (body.option_groups?.length) {
+    const synced = await syncServiceOptionGroups(serviceId, body.option_groups)
+    if (!synced.ok) {
+      await supabase.from("provider_services").delete().eq("id", serviceId)
+      return c.json({ error: synced.error }, synced.statusCode)
+    }
+  }
+
+  const full = await attachOptionGroupsToService(data as unknown as Record<string, unknown>)
+  return c.json({ data: full }, 201)
 })
 
 servicesRouter.get(
@@ -220,7 +255,8 @@ servicesRouter.get(
 
     if (error) return c.json({ error: error.message }, 500)
     if (!data) return c.json({ error: "Service not found" }, 404)
-    return c.json({ data })
+    const full = await attachOptionGroupsToService(data as unknown as Record<string, unknown>)
+    return c.json({ data: full })
   },
 )
 
@@ -307,6 +343,9 @@ servicesRouter.patch(
     if (body.description !== undefined) updates.description = body.description
     if (body.price_flat !== undefined) updates.price_flat = body.price_flat
     if (body.location !== undefined) updates.location = body.location
+    if (body.contact_phone !== undefined) updates.contact_phone = body.contact_phone
+    if (body.contact_email !== undefined) updates.contact_email = body.contact_email
+    if (body.website !== undefined) updates.website = body.website === "" ? null : body.website
     if (body.image_url !== undefined) updates.image_url = body.image_url
     if (body.images !== undefined) updates.images = body.images
     if (body.sort_order !== undefined) updates.sort_order = body.sort_order
@@ -321,11 +360,17 @@ servicesRouter.patch(
       return c.json({ error: error.message }, 400)
     }
     if (!data) return c.json({ error: "Service not found or unauthorized" }, 404)
-    return c.json({ data })
+
+    if (body.option_groups !== undefined) {
+      const synced = await syncServiceOptionGroups(id, body.option_groups)
+      if (!synced.ok) return c.json({ error: synced.error }, synced.statusCode)
+    }
+
+    const full = await attachOptionGroupsToService(data as unknown as Record<string, unknown>)
+    return c.json({ data: full })
   },
 )
 
-/** Public detail by slug — published only. */
 servicesRouter.get("/:slug", async (c) => {
   const slug = c.req.param("slug")
 
@@ -333,20 +378,30 @@ servicesRouter.get("/:slug", async (c) => {
     .from("provider_services")
     .select(SERVICE_SELECT_PUBLIC + ", description")
     .eq("slug", slug)
-    .eq("status", "published")
+    .eq("status", "enabled")
     .maybeSingle()
 
   if (error) return c.json({ error: error.message }, 500)
   if (!data) return c.json({ error: "Service not found" }, 404)
-  return c.json({ data })
+  const full = await attachOptionGroupsToService(data as unknown as Record<string, unknown>, true)
+  return c.json({ data: full })
 })
 
-export function buildServiceSnapshot(svc: Record<string, unknown>, quantity: number): Record<string, unknown> {
+export function buildServiceSnapshot(
+  svc: Record<string, unknown>,
+  quantity: number,
+  selections: Record<string, unknown>[] = [],
+  unitPrice?: number,
+): Record<string, unknown> {
+  const base = Number(svc.price_flat) || 0
+  const unit = unitPrice ?? base
   return {
     service_name: svc.name,
     service_slug: svc.slug,
     kind: svc.kind,
-    price_flat: svc.price_flat,
+    price_flat: base,
+    unit_price: unit,
     quantity,
+    selected_options: selections,
   }
 }

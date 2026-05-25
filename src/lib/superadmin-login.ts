@@ -35,9 +35,6 @@ export type MonitoringLoginResult =
 	| { source: 'db'; monitoringAdminId: string; username: string }
 	| { source: 'env'; username: string };
 
-/**
- * DB `monitoring_admins` rows first (password disabled accounts skipped), then env bootstrap match.
- */
 export async function authenticateSuperadminLogin(
 	usernameRaw: string,
 	password: string,

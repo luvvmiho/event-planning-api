@@ -47,7 +47,7 @@ adminProvidersRouter.get("/:id", async (c) => {
 
   const { data: venues } = await supabase
     .from("venues")
-    .select("id, name, slug, rating, review_count, price_per_person, is_featured, created_at")
+    .select("id, name, slug, rating, review_count, price_flat, is_featured, created_at")
     .eq("provider_id", providerId)
 
   const venueIds = new Set((venues ?? []).map((v) => v.id))

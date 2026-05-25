@@ -5,6 +5,11 @@ import { supabase } from '../lib/supabase.js';
 import { authenticate } from '../middleware/auth.js';
 import { buildPackageSnapshot } from './venue-packages.js';
 import { buildServiceSnapshot } from './services.js';
+import {
+	computeServiceUnitPrice,
+	resolveServiceOptionSelections,
+} from '../lib/service-options.js';
+import { venueOnlyOrderPrice, venuePackageOrderPrice } from '../lib/venue-pricing.js';
 
 export const ordersRouter = new Hono();
 
@@ -31,9 +36,9 @@ const serviceOrderItemSchema = z.object({
 	serviceId: z.string().uuid(),
 	...orderLineDisplaySchema,
 	quantity: z.coerce.number().int().min(1).default(1),
+	selected_options: z.array(z.string().uuid()).optional().default([]),
 });
 
-/** Venue booking line (legacy items without itemType still work). */
 const legacyVenueOrderItemSchema = z
 	.object({
 		venueId: z.string(),
@@ -65,20 +70,38 @@ async function resolveServiceOrderItem(
 		.from('provider_services')
 		.select('id, slug, name, kind, price_flat, status')
 		.eq('id', item.serviceId)
-		.eq('status', 'published')
+		.eq('status', 'enabled')
 		.maybeSingle();
 
 	if (svcErr || !svc) {
 		return { item: { ...item }, error: 'Сонгосон үйлчилгээ олдсонгүй эсвэл идэвхгүй байна.' };
 	}
 
-	const linePrice = svc.price_flat * item.quantity;
-	const snapshot = buildServiceSnapshot(svc as Record<string, unknown>, item.quantity);
+	const selectedOptionIds = item.selected_options ?? [];
+	const resolvedOptions = await resolveServiceOptionSelections(item.serviceId, selectedOptionIds);
+	if (!resolvedOptions.ok) {
+		return { item: { ...item }, error: resolvedOptions.error };
+	}
+
+	const unitPrice = computeServiceUnitPrice(
+		Number(svc.price_flat),
+		resolvedOptions.optionsPriceSum,
+		resolvedOptions.hasOptionGroups,
+		resolvedOptions.selections.length > 0,
+	);
+	const linePrice = unitPrice * item.quantity;
+	const snapshot = buildServiceSnapshot(
+		svc as Record<string, unknown>,
+		item.quantity,
+		resolvedOptions.selections,
+		unitPrice,
+	);
 
 	const line: Record<string, unknown> = {
 		...item,
 		itemType: 'service',
 		price: linePrice,
+		selected_options: selectedOptionIds,
 		service_snapshot: snapshot,
 	};
 
@@ -91,21 +114,40 @@ async function resolveVenueOrderItemWithPackage(
 	const venueId = item.venueId;
 	const packageId = 'packageId' in item ? item.packageId : undefined;
 
-	if (!packageId) {
-		if (!z.string().uuid().safeParse(venueId).success) {
-			return { item: { ...item, itemType: 'venue' }, error: 'Байршлын ID буруу байна.' };
-		}
-		return { item: { ...item, itemType: 'venue' } };
+	if (!z.string().uuid().safeParse(venueId).success) {
+		return { item: { ...item, itemType: 'venue' }, error: 'Байршлын ID буруу байна.' };
 	}
 
-	if (!z.string().uuid().safeParse(venueId).success || !z.string().uuid().safeParse(packageId).success) {
+	const { data: venue, error: venueErr } = await supabase
+		.from('venues')
+		.select('id, price_flat, status')
+		.eq('id', venueId)
+		.eq('status', 'enabled')
+		.maybeSingle();
+
+	if (venueErr || !venue) {
+		return { item: { ...item, itemType: 'venue' }, error: 'Байршил олдсонгүй эсвэл идэвхгүй байна.' };
+	}
+
+	if (!packageId) {
+		return {
+			item: {
+				...item,
+				itemType: 'venue',
+				price: venueOnlyOrderPrice(Number(venue.price_flat)),
+				pricing_mode: 'venue_flat',
+			},
+		};
+	}
+
+	if (!z.string().uuid().safeParse(packageId).success) {
 		return { item: { ...item, itemType: 'venue' }, error: 'Багц эсвэл байршлын ID буруу байна.' };
 	}
 
 	const { data: pkg, error: pkgErr } = await supabase
 		.from('venue_event_packages')
 		.select(
-			'id, venue_id, slug, name, short_description, price_flat, guests_min, guests_max, is_active, venue_package_services (kind, title, quantity, is_included, sort_order)',
+			'id, venue_id, slug, name, short_description, price_per_person, guests_min, guests_max, is_active, venue_package_services (kind, title, quantity, is_included, sort_order)',
 		)
 		.eq('id', packageId)
 		.eq('venue_id', venueId)
@@ -123,12 +165,13 @@ async function resolveVenueOrderItemWithPackage(
 		return { item: { ...item, itemType: 'venue' }, error: `Зочдын тоо ихдээ ${pkg.guests_max} байх ёстой.` };
 	}
 
-	const snapshot = buildPackageSnapshot(pkg as Record<string, unknown>);
+	const snapshot = buildPackageSnapshot(pkg as Record<string, unknown>, item.guestCount);
 
 	const line: Record<string, unknown> = {
 		...item,
 		itemType: 'venue',
-		price: pkg.price_flat,
+		price: venuePackageOrderPrice(Number(pkg.price_per_person), item.guestCount),
+		pricing_mode: 'package_per_person',
 		packageId: pkg.id,
 		package_slug: pkg.slug,
 		package_snapshot: snapshot,
@@ -144,7 +187,6 @@ async function resolveOrderItem(item: OrderItemInput): Promise<{ item: Record<st
 	return resolveVenueOrderItemWithPackage(item);
 }
 
-/** Shared with event-plans checkout — validates lines and applies server pricing. */
 export async function resolveOrderLineItems(
 	rawItems: Record<string, unknown>[],
 ): Promise<{ resolved: Record<string, unknown>[]; subtotal: number } | { error: string }> {

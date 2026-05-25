@@ -9,6 +9,7 @@ import {
 } from '../lib/event-plan-build.js';
 import { authenticate } from '../middleware/auth.js';
 import { resolveOrderLineItems } from './orders.js';
+import { resolveServiceOptionSelections } from '../lib/service-options.js';
 
 export const eventPlansRouter = new Hono();
 
@@ -58,11 +59,17 @@ const addServiceSchema = z.object({
 	provider_service_id: z.string().uuid(),
 	quantity: z.coerce.number().int().min(1).default(1),
 	sort_order: z.coerce.number().int().optional().default(0),
+	selected_options: z.array(z.string().uuid()).optional().default([]),
 });
 
-const patchServiceLineSchema = z.object({
-	quantity: z.coerce.number().int().min(1),
-});
+const patchServiceLineSchema = z
+	.object({
+		quantity: z.coerce.number().int().min(1).optional(),
+		selected_options: z.array(z.string().uuid()).optional(),
+	})
+	.refine((v) => v.quantity !== undefined || v.selected_options !== undefined, {
+		message: 'Шинэчлэх талбар оруулна уу',
+	});
 
 const checkoutSchema = z.object({
 	fullName: z.string().min(1),
@@ -182,7 +189,6 @@ eventPlansRouter.delete('/:id', zValidator('param', planIdParam), async (c) => {
 	return c.json({ data: { deleted: true, id } });
 });
 
-/** Choose venue (and optional package) for the plan. */
 eventPlansRouter.put('/:id/venue', zValidator('param', planIdParam), zValidator('json', setVenueSchema), async (c) => {
 	const { id } = c.req.valid('param');
 	const user = c.var.user;
@@ -196,7 +202,7 @@ eventPlansRouter.put('/:id/venue', zValidator('param', planIdParam), zValidator(
 		.from('venues')
 		.select('id, status')
 		.eq('id', body.venue_id)
-		.eq('status', 'published')
+		.eq('status', 'enabled')
 		.maybeSingle();
 	if (!venue) return c.json({ error: 'Байршил олдсонгүй эсвэл идэвхгүй байна' }, 400);
 
@@ -278,15 +284,22 @@ eventPlansRouter.post(
 			.from('provider_services')
 			.select('id')
 			.eq('id', body.provider_service_id)
-			.eq('status', 'published')
+			.eq('status', 'enabled')
 			.maybeSingle();
 		if (!svc) return c.json({ error: 'Үйлчилгээ олдсонгүй эсвэл идэвхгүй байна' }, 400);
+
+		const selectedOptions = body.selected_options ?? [];
+		const resolved = await resolveServiceOptionSelections(body.provider_service_id, selectedOptions, {
+			requireSelectionWhenGroupsExist: true,
+		});
+		if (!resolved.ok) return c.json({ error: resolved.error }, 400);
 
 		const { error } = await supabase.from('event_plan_services').insert({
 			plan_id: id,
 			provider_service_id: body.provider_service_id,
 			quantity: body.quantity,
 			sort_order: body.sort_order,
+			selected_option_ids: selectedOptions,
 		});
 
 		if (error) {
@@ -307,7 +320,7 @@ eventPlansRouter.patch(
 	async (c) => {
 		const { id, lineId } = c.req.valid('param');
 		const user = c.var.user;
-		const { quantity } = c.req.valid('json');
+		const body = c.req.valid('json');
 
 		const { plan, forbidden } = await loadEventPlanForUser(id, user.id);
 		if (forbidden) return c.json({ error: 'Unauthorized' }, 403);
@@ -315,13 +328,24 @@ eventPlansRouter.patch(
 
 		const { data: line } = await supabase
 			.from('event_plan_services')
-			.select('id')
+			.select('id, provider_service_id, selected_option_ids')
 			.eq('id', lineId)
 			.eq('plan_id', id)
 			.maybeSingle();
 		if (!line) return c.json({ error: 'Line not found' }, 404);
 
-		await supabase.from('event_plan_services').update({ quantity }).eq('id', lineId);
+		const updates: Record<string, unknown> = {};
+		if (body.quantity !== undefined) updates.quantity = body.quantity;
+
+		if (body.selected_options !== undefined) {
+			const resolved = await resolveServiceOptionSelections(line.provider_service_id, body.selected_options, {
+				requireSelectionWhenGroupsExist: true,
+			});
+			if (!resolved.ok) return c.json({ error: resolved.error }, 400);
+			updates.selected_option_ids = body.selected_options;
+		}
+
+		await supabase.from('event_plan_services').update(updates).eq('id', lineId);
 		await supabase.from('event_plans').update({ updated_at: new Date().toISOString() }).eq('id', id);
 
 		const { plan: updated } = await loadEventPlanForUser(id, user.id);
@@ -344,7 +368,6 @@ eventPlansRouter.delete('/:id/services/:lineId', zValidator('param', lineIdParam
 	return c.json({ data: await planResponse(updated!) });
 });
 
-/** Convert plan → order (same rules as POST /orders/make-order). */
 eventPlansRouter.post(
 	'/:id/checkout',
 	zValidator('param', planIdParam),
@@ -363,12 +386,17 @@ eventPlansRouter.post(
 			return c.json({ error: 'Байршил эсвэл үйлчилгээ сонгоно уу' }, 400);
 		}
 
+		const incomplete = summary.services.filter((l) => !l.options_complete);
+		if (incomplete.length > 0) {
+			return c.json({ error: 'Зарим үйлчилгээний сонголт дуусаагүй байна' }, 400);
+		}
+
 		const items: Record<string, unknown>[] = [];
 
 		if (summary.venue) {
 			const { data: venue } = await supabase
 				.from('venues')
-				.select('id, name, slug, image_url, price_per_person, categories(slug, name)')
+				.select('id, name, slug, image_url, price_flat, categories(slug, name)')
 				.eq('id', summary.venue.venue_id)
 				.single();
 
@@ -401,6 +429,7 @@ eventPlansRouter.post(
 				image: line.service.image_url ?? '',
 				quantity: line.quantity,
 				price: line.estimated_price,
+				selected_options: line.selected_option_ids,
 				bookingDate: plan.event_date ?? new Date().toISOString().slice(0, 10),
 			});
 		}

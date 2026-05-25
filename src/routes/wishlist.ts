@@ -16,7 +16,7 @@ const addBodySchema = z.object({
 });
 
 const venueCardSelect =
-	'id, slug, name, short_description, location, district, capacity_min, capacity_max, price_per_person, rating, review_count, image_url, images, is_featured, is_new, created_at, categories(id, slug, name)';
+	'id, slug, name, short_description, location, district, capacity_min, capacity_max, price_flat, rating, review_count, image_url, images, is_featured, is_new, created_at, categories(id, slug, name)';
 
 wishlistRouter.get('/', authenticate, zValidator('query', listQuerySchema), async (c) => {
 	const user = c.var.user;

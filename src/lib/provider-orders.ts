@@ -53,7 +53,6 @@ export const orderTouchesProvider = (
 	})
 }
 
-/** @deprecated Use orderTouchesProvider */
 export const orderTouchesVenues = (order: Pick<OrderRow, "items">, venueIds: Set<string>): boolean =>
 	orderTouchesProvider(order, venueIds, new Set())
 
@@ -87,7 +86,6 @@ export const displayOrderRef = (id: string): string => {
 	return `#NR-${compact.slice(-6)}`
 }
 
-/** UTC calendar month bounds: `monthsAgo` 0 = current month, 1 = previous month. */
 export const calendarMonthBoundsUtc = (monthsAgo: number): { start: Date; end: Date } => {
 	const now = new Date()
 	const y = now.getUTCFullYear()

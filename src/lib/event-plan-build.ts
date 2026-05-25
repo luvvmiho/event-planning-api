@@ -1,4 +1,10 @@
 import { supabase } from './supabase.js';
+import { venueOnlyOrderPrice, venuePackageOrderPrice } from './venue-pricing.js';
+import {
+	computeServiceUnitPrice,
+	resolveServiceOptionSelections,
+	type ResolvedServiceOption,
+} from './service-options.js';
 
 export type EventPlanRow = {
 	id: string;
@@ -28,8 +34,9 @@ export type PlanVenueEstimate = {
 	guest_count: number;
 	booking_date: string | null;
 	estimated_price: number;
-	pricing_mode: 'per_person' | 'package_flat';
-	price_per_person: number | null;
+	pricing_mode: 'venue_flat' | 'package_per_person';
+	price_flat: number | null;
+	package_price_per_person: number | null;
 };
 
 export type PlanServiceLine = {
@@ -38,6 +45,11 @@ export type PlanServiceLine = {
 	quantity: number;
 	sort_order: number;
 	estimated_price: number;
+	unit_price: number;
+	selected_option_ids: string[];
+	selected_options: ResolvedServiceOption[];
+	has_option_groups: boolean;
+	options_complete: boolean;
 	service: {
 		id: string;
 		slug: string;
@@ -78,30 +90,32 @@ export async function buildEventPlanSummary(plan: EventPlanRow): Promise<EventPl
 		const guests = plan.venue_guest_count ?? plan.guest_count ?? 1;
 		const { data: venue } = await supabase
 			.from('venues')
-			.select('id, slug, name, provider_id, price_per_person, status')
+			.select('id, slug, name, provider_id, price_flat, status')
 			.eq('id', plan.venue_id)
-			.eq('status', 'published')
+			.eq('status', 'enabled')
 			.maybeSingle();
 
 		if (venue) {
 			providerIds.add(venue.provider_id as string);
-			let estimated = guests * Number(venue.price_per_person);
-			let pricing_mode: 'per_person' | 'package_flat' = 'per_person';
+			let estimated = venueOnlyOrderPrice(Number(venue.price_flat));
+			let pricing_mode: 'venue_flat' | 'package_per_person' = 'venue_flat';
 			let packageId: string | null = null;
 			let packageName: string | null = null;
 			let packageSlug: string | null = null;
+			let packagePricePerPerson: number | null = null;
 
 			if (plan.venue_package_id) {
 				const { data: pkg } = await supabase
 					.from('venue_event_packages')
-					.select('id, slug, name, price_flat, is_active')
+					.select('id, slug, name, price_per_person, is_active')
 					.eq('id', plan.venue_package_id)
 					.eq('venue_id', plan.venue_id)
 					.eq('is_active', true)
 					.maybeSingle();
 				if (pkg) {
-					estimated = pkg.price_flat;
-					pricing_mode = 'package_flat';
+					packagePricePerPerson = Number(pkg.price_per_person);
+					estimated = venuePackageOrderPrice(packagePricePerPerson, guests);
+					pricing_mode = 'package_per_person';
 					packageId = pkg.id;
 					packageName = pkg.name;
 					packageSlug = pkg.slug;
@@ -120,7 +134,8 @@ export async function buildEventPlanSummary(plan: EventPlanRow): Promise<EventPl
 				booking_date: plan.venue_booking_date,
 				estimated_price: estimated,
 				pricing_mode,
-				price_per_person: venue.price_per_person,
+				price_flat: Number(venue.price_flat),
+				package_price_per_person: packagePricePerPerson,
 			};
 		}
 	}
@@ -128,7 +143,7 @@ export async function buildEventPlanSummary(plan: EventPlanRow): Promise<EventPl
 	const { data: lines } = await supabase
 		.from('event_plan_services')
 		.select(
-			'id, provider_service_id, quantity, sort_order, provider_services (id, slug, name, kind, price_flat, provider_id, image_url, status)',
+			'id, provider_service_id, quantity, sort_order, selected_option_ids, provider_services (id, slug, name, kind, price_flat, provider_id, image_url, status)',
 		)
 		.eq('plan_id', plan.id)
 		.order('sort_order', { ascending: true });
@@ -137,21 +152,43 @@ export async function buildEventPlanSummary(plan: EventPlanRow): Promise<EventPl
 	for (const row of lines ?? []) {
 		const raw = row.provider_services as Record<string, unknown> | Record<string, unknown>[] | null;
 		const svc = Array.isArray(raw) ? raw[0] : raw;
-		if (!svc || svc.status !== 'published') continue;
+		if (!svc || svc.status !== 'enabled') continue;
 		providerIds.add(String(svc.provider_id));
 		const qty = Number(row.quantity) || 1;
+		const basePrice = Number(svc.price_flat);
+		const selectedOptionIds = Array.isArray(row.selected_option_ids)
+			? row.selected_option_ids.map(String)
+			: [];
+		const resolved = await resolveServiceOptionSelections(String(svc.id), selectedOptionIds);
+		const hasOptionGroups = resolved.ok && resolved.hasOptionGroups;
+		const selections = resolved.ok ? resolved.selections : [];
+		const unitPrice = resolved.ok
+			? computeServiceUnitPrice(
+					basePrice,
+					resolved.optionsPriceSum,
+					resolved.hasOptionGroups,
+					resolved.selections.length > 0,
+				)
+			: basePrice;
+		const optionsComplete = !hasOptionGroups || (selectedOptionIds.length > 0 && resolved.ok);
+
 		services.push({
 			id: row.id,
 			provider_service_id: row.provider_service_id,
 			quantity: qty,
 			sort_order: row.sort_order,
-			estimated_price: Number(svc.price_flat) * qty,
+			estimated_price: unitPrice * qty,
+			unit_price: unitPrice,
+			selected_option_ids: selectedOptionIds,
+			selected_options: selections,
+			has_option_groups: hasOptionGroups,
+			options_complete: optionsComplete,
 			service: {
 				id: String(svc.id),
 				slug: String(svc.slug),
 				name: String(svc.name),
 				kind: String(svc.kind),
-				price_flat: Number(svc.price_flat),
+				price_flat: basePrice,
 				provider_id: String(svc.provider_id),
 				image_url: (svc.image_url as string) ?? null,
 			},

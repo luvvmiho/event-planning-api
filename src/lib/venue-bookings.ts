@@ -1,7 +1,6 @@
 import { z } from 'zod';
 import { supabase } from './supabase.js';
 
-/** Matches `orders.status` when the provider has accepted / verified the order (DB: `paid`). */
 const BOOKED_STATUSES = new Set(['paid']);
 
 type OrderItemLike = {
@@ -11,10 +10,6 @@ type OrderItemLike = {
 
 const parseItems = (items: unknown): OrderItemLike[] => (Array.isArray(items) ? items : []) as OrderItemLike[];
 
-/**
- * Keeps `venue_booked_dates` in sync with a single order: removes old rows, then if the order
- * is paid, inserts one row per line item (venue + booking day).
- */
 export async function syncVenueBookingsForOrder(
 	orderId: string,
 	items: unknown,
